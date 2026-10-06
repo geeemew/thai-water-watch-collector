@@ -1,0 +1,117 @@
+name: Store unapproved source snapshots
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tww-collector-staging
+  cancel-in-progress: false
+
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and stage raw water and rain
+        env:
+          TWW_COLLECTOR_TOKEN: ${{ secrets.TWW_COLLECTOR_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          """Manual raw-source staging upload. Only latest unapproved source snapshots persist."""
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          import re
+          from datetime import datetime, timezone
+          
+          TOKEN = os.environ.get('TWW_COLLECTOR_TOKEN', '')
+          if len(TOKEN) < 32 or TOKEN.strip() != TOKEN:
+              raise SystemExit('Set GitHub secret TWW_COLLECTOR_TOKEN (at least 32 characters).')
+          WORKER = 'https://thai-water-watch.geee-mew.workers.dev/collector-stage'
+          BASE = 'https://api-v3.thaiwater.net/api/v1/thaiwater30/public/'
+          LIMIT = 8 * 1024 * 1024
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          opener = urllib.request.build_opener(NoRedirect())
+          opener.addheaders = [('User-Agent', 'ThaiWaterWatchCollector/0.6.3 (+https://github.com/geeemew/thai-water-watch-collector)')]
+          summary = ['## Cloudflare unapproved source staging', '',
+                     'Manual test. Latest raw snapshots are stored in D1 staging only. No approved observations, schedule or alerts.', '']
+          
+          def safe(value):
+              return re.sub(r'[^a-zA-Z0-9 _.:/=-]', '', str(value).replace(TOKEN, '[REDACTED]'))[:180]
+          
+          def describe_http_error(error):
+              raw = error.read(8192).decode('utf-8', errors='replace')
+              detail = {'http': error.code,
+                        'content_type': safe(error.headers.get('Content-Type', '')),
+                        'server': safe(error.headers.get('Server', '')),
+                        'cf_ray': safe(error.headers.get('CF-Ray', '')),
+                        'cf_mitigated': safe(error.headers.get('cf-mitigated', ''))}
+              if 'text/plain' in error.headers.get('Content-Type', '').lower():
+                  detail['plain_reason'] = safe(raw[:500])
+              try:
+                  data = json.loads(raw)
+                  if isinstance(data, dict):
+                      detail['receiver_error'] = safe(data.get('error', ''))
+              except (ValueError, TypeError):
+                  title = re.search(r'<title[^>]*>(.*?)</title>', raw, re.I | re.S)
+                  code = re.search(r'(?:error code:|error\s+)(\d{4})', raw, re.I)
+                  if title:
+                      detail['page_title'] = safe(title.group(1))
+                  if code:
+                      detail['edge_error_code'] = code.group(1)
+              return json.dumps(detail)
+          
+          passed = 0
+          for source, endpoint in [('thaiwater-water', 'waterlevel_load'), ('thaiwater-rain', 'rain_24h')]:
+              stage = 'SOURCE'
+              try:
+                  request = urllib.request.Request(BASE + endpoint, headers={'Accept': 'application/json'})
+                  with opener.open(request, timeout=30) as response:
+                      raw = response.read(LIMIT + 1)
+                      if len(raw) > LIMIT:
+                          raise ValueError('Source response too large')
+                      payload = json.loads(raw)
+                  envelope = {'protocol': 'tww-stage-v1', 'source': source,
+                              'collected_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                              'payload': payload}
+                  encoded = json.dumps(envelope, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+                  if len(encoded) > LIMIT:
+                      raise ValueError('Upload too large')
+                  stage = 'WORKER'
+                  request = urllib.request.Request(WORKER, data=encoded, method='POST', headers={
+                      'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'})
+                  with opener.open(request, timeout=45) as response:
+                      result_raw = response.read(65537)
+                      if len(result_raw) > 65536:
+                          raise ValueError('Diagnostic response too large')
+                      result = json.loads(result_raw)
+                  if result.get('verdict') not in ('STAGED_PENDING_REVIEW_OBSERVATIONS_DISABLED', 'STAGING_ALREADY_PRESENT_OBSERVATIONS_DISABLED') or result.get('observation_writes') != 0 or result.get('observation_ingestion_enabled') is not False:
+                      raise ValueError('Unexpected receiver result')
+                  print(json.dumps(result, ensure_ascii=False, indent=2))
+                  counts = result['counts']
+                  summary.append(f"- {source}: {result['verdict']}; rows={result['rows']}; chunks={result['chunks']}; staging rows written={result['staging_rows_written']}; observation writes=0")
+                  passed += 1
+              except urllib.error.HTTPError as error:
+                  # Do not dump remote responses or request headers into public logs.
+                  message = f'{source}: {stage} ' + describe_http_error(error) + '; no retry'
+                  print(message)
+                  summary.append('- ' + message)
+              except Exception as error:
+                  # Error details could contain sensitive URLs/headers; log type only.
+                  message = f'{source}: {stage} failed ({type(error).__name__})'
+                  print(message)
+                  summary.append('- ' + message)
+          
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          if passed != 2:
+              raise SystemExit(1)
+          PY
