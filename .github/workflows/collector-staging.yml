@@ -2,6 +2,8 @@ name: Store unapproved source snapshots
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
 
 permissions:
   contents: read
@@ -42,7 +44,7 @@ jobs:
           opener = urllib.request.build_opener(NoRedirect())
           opener.addheaders = [('User-Agent', 'ThaiWaterWatchCollector/0.6.3 (+https://github.com/geeemew/thai-water-watch-collector)')]
           summary = ['## Cloudflare unapproved source staging', '',
-                     'Manual test. Latest raw snapshots are stored in D1 staging only. No approved observations, schedule or alerts.', '']
+                     'Runs every 30 minutes or manually. Latest raw snapshots are stored in D1 staging only. No approved observations, schedule or alerts.', '']
           
           def safe(value):
               return re.sub(r'[^a-zA-Z0-9 _.:/=-]', '', str(value).replace(TOKEN, '[REDACTED]'))[:180]
