@@ -40,6 +40,7 @@ jobs:
                   return None
           
           opener = urllib.request.build_opener(NoRedirect())
+          opener.addheaders = [('User-Agent', 'ThaiWaterWatchCollector/0.6.2 (+https://github.com/geeemew/thai-water-watch-collector)')]
           summary = ['## Cloudflare collector dry run', '',
                      'Manual test. No D1 writes, persistence, automatic schedule or alerts.', '']
           
@@ -48,12 +49,13 @@ jobs:
           
           def describe_http_error(error):
               raw = error.read(8192).decode('utf-8', errors='replace')
-              print("Cloudflare reason:", safe(raw[:500]))
               detail = {'http': error.code,
                         'content_type': safe(error.headers.get('Content-Type', '')),
                         'server': safe(error.headers.get('Server', '')),
                         'cf_ray': safe(error.headers.get('CF-Ray', '')),
                         'cf_mitigated': safe(error.headers.get('cf-mitigated', ''))}
+              if 'text/plain' in error.headers.get('Content-Type', '').lower():
+                  detail['plain_reason'] = safe(raw[:500])
               try:
                   data = json.loads(raw)
                   if isinstance(data, dict):
