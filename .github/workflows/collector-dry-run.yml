@@ -25,6 +25,7 @@ jobs:
           import os
           import urllib.request
           import urllib.error
+          import re
           from datetime import datetime, timezone
           
           TOKEN = os.environ.get('TWW_COLLECTOR_TOKEN', '')
@@ -41,6 +42,54 @@ jobs:
           opener = urllib.request.build_opener(NoRedirect())
           summary = ['## Cloudflare collector dry run', '',
                      'Manual test. No D1 writes, persistence, automatic schedule or alerts.', '']
+          
+          def safe(value):
+              return re.sub(r'[^a-zA-Z0-9 _.:/=-]', '', str(value).replace(TOKEN, '[REDACTED]'))[:180]
+          
+          def describe_http_error(error):
+              raw = error.read(8192).decode('utf-8', errors='replace')
+              detail = {'http': error.code,
+                        'content_type': safe(error.headers.get('Content-Type', '')),
+                        'server': safe(error.headers.get('Server', '')),
+                        'cf_ray': safe(error.headers.get('CF-Ray', '')),
+                        'cf_mitigated': safe(error.headers.get('cf-mitigated', ''))}
+              try:
+                  data = json.loads(raw)
+                  if isinstance(data, dict):
+                      detail['receiver_error'] = safe(data.get('error', ''))
+              except (ValueError, TypeError):
+                  title = re.search(r'<title[^>]*>(.*?)</title>', raw, re.I | re.S)
+                  code = re.search(r'(?:error code:|error\s+)(\d{4})', raw, re.I)
+                  if title:
+                      detail['page_title'] = safe(title.group(1))
+                  if code:
+                      detail['edge_error_code'] = code.group(1)
+              return json.dumps(detail)
+          
+          # Separate network access, receiver authentication and upload-size failures.
+          probes = [
+              ('GET collector-status', urllib.request.Request(WORKER.replace('/collector-dry-run', '/collector-status'))),
+              ('POST small authenticated diagnostic', urllib.request.Request(
+                  WORKER, data=b'{"protocol":"diagnostic-probe"}', method='POST',
+                  headers={'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'})),
+          ]
+          for label, request in probes:
+              try:
+                  with opener.open(request, timeout=30) as response:
+                      raw = response.read(8192)
+                      result = json.loads(raw)
+                      message = f'{label}: HTTP {response.status}'
+                      if isinstance(result, dict):
+                          message += '; version=' + safe(result.get('version', ''))
+                          message += '; token_configured=' + safe(result.get('token_configured', ''))
+              except urllib.error.HTTPError as error:
+                  message = label + ': ' + describe_http_error(error)
+              except Exception as error:
+                  message = label + ': failed (' + type(error).__name__ + ')'
+              print(message)
+              summary.append('- ' + message)
+          summary.append('Small POST should return HTTP 400 / INVALID_PROTOCOL when the receiver and secret are reachable.')
+          
           passed = 0
           for source, endpoint in [('thaiwater-water', 'waterlevel_load'), ('thaiwater-rain', 'rain_24h')]:
               stage = 'SOURCE'
@@ -73,7 +122,7 @@ jobs:
                   passed += 1
               except urllib.error.HTTPError as error:
                   # Do not dump remote responses or request headers into public logs.
-                  message = f'{source}: {stage} HTTP {error.code}; no retry'
+                  message = f'{source}: {stage} ' + describe_http_error(error) + '; no retry'
                   print(message)
                   summary.append('- ' + message)
               except Exception as error:
