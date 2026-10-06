@@ -1,0 +1,89 @@
+name: Test Cloudflare receiver
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tww-collector-dry-run
+  cancel-in-progress: false
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch water and rain then validate at Cloudflare
+        env:
+          TWW_COLLECTOR_TOKEN: ${{ secrets.TWW_COLLECTOR_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          """One-shot authenticated transport diagnostic; no observations are stored."""
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
+          
+          TOKEN = os.environ.get('TWW_COLLECTOR_TOKEN', '')
+          if len(TOKEN) < 32 or TOKEN.strip() != TOKEN:
+              raise SystemExit('Set GitHub secret TWW_COLLECTOR_TOKEN (at least 32 characters).')
+          WORKER = 'https://thai-water-watch.geee-mew.workers.dev/collector-dry-run'
+          BASE = 'https://api-v3.thaiwater.net/api/v1/thaiwater30/public/'
+          LIMIT = 8 * 1024 * 1024
+          
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          
+          opener = urllib.request.build_opener(NoRedirect())
+          summary = ['## Cloudflare collector dry run', '',
+                     'Manual test. No D1 writes, persistence, automatic schedule or alerts.', '']
+          passed = 0
+          for source, endpoint in [('thaiwater-water', 'waterlevel_load'), ('thaiwater-rain', 'rain_24h')]:
+              stage = 'SOURCE'
+              try:
+                  request = urllib.request.Request(BASE + endpoint, headers={'Accept': 'application/json'})
+                  with opener.open(request, timeout=30) as response:
+                      raw = response.read(LIMIT + 1)
+                      if len(raw) > LIMIT:
+                          raise ValueError('Source response too large')
+                      payload = json.loads(raw)
+                  envelope = {'protocol': 'tww-dry-run-v1', 'source': source,
+                              'collected_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                              'payload': payload}
+                  encoded = json.dumps(envelope, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+                  if len(encoded) > LIMIT:
+                      raise ValueError('Upload too large')
+                  stage = 'WORKER'
+                  request = urllib.request.Request(WORKER, data=encoded, method='POST', headers={
+                      'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'})
+                  with opener.open(request, timeout=45) as response:
+                      result_raw = response.read(65537)
+                      if len(result_raw) > 65536:
+                          raise ValueError('Diagnostic response too large')
+                      result = json.loads(result_raw)
+                  if result.get('verdict') != 'TRANSPORT_OK_INGESTION_DISABLED' or result.get('d1_writes') != 0 or result.get('ingestion_enabled') is not False:
+                      raise ValueError('Unexpected receiver result')
+                  print(json.dumps(result, ensure_ascii=False, indent=2))
+                  counts = result['counts']
+                  summary.append(f"- {source}: transport OK; rows={counts['rows']}; fresh measurable candidates={result['fresh_measurable_candidates']}; stale={counts['STALE']}; future={counts['FUTURE']}; D1 writes=0")
+                  passed += 1
+              except urllib.error.HTTPError as error:
+                  # Do not dump remote responses or request headers into public logs.
+                  message = f'{source}: {stage} HTTP {error.code}; no retry'
+                  print(message)
+                  summary.append('- ' + message)
+              except Exception as error:
+                  # Error details could contain sensitive URLs/headers; log type only.
+                  message = f'{source}: {stage} failed ({type(error).__name__})'
+                  print(message)
+                  summary.append('- ' + message)
+          
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write('\n'.join(summary) + '\n')
+          if passed != 2:
+              raise SystemExit(1)
+          PY
