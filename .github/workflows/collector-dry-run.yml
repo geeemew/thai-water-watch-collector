@@ -48,6 +48,7 @@ jobs:
           
           def describe_http_error(error):
               raw = error.read(8192).decode('utf-8', errors='replace')
+              print("Cloudflare reason:", safe(raw[:500]))
               detail = {'http': error.code,
                         'content_type': safe(error.headers.get('Content-Type', '')),
                         'server': safe(error.headers.get('Server', '')),
