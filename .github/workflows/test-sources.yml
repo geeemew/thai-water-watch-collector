@@ -1,0 +1,66 @@
+name: Test ThaiWater
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test sources without saving observations
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+
+          base = "https://api-v3.thaiwater.net/api/v1/thaiwater30/public/"
+          sources = [
+              ("Water", "waterlevel_load", "waterlevel_datetime"),
+              ("Rain", "rain_24h", "rainfall_datetime"),
+              ("Flow", "flow", "flow_datetime"),
+          ]
+          passed = 0
+          report = ["## ThaiWater connectivity test", "",
+                    "Read only. No D1 writes or uploads.", ""]
+          for name, endpoint, time_field in sources:
+              try:
+                  req = urllib.request.Request(
+                      base + endpoint,
+                      headers={"Accept": "application/json"}
+                  )
+                  with urllib.request.urlopen(req, timeout=25) as response:
+                      raw = response.read(8 * 1024 * 1024 + 1)
+                      if len(raw) > 8 * 1024 * 1024:
+                          raise ValueError("Response too large")
+                      payload = json.loads(raw)
+                  root = payload.get("waterlevel_data", {}) if endpoint == "waterlevel_load" else payload
+                  rows = root.get("data")
+                  if not isinstance(rows, list):
+                      raise ValueError("Unexpected data schema")
+                  times = sorted(
+                      r[time_field] for r in rows
+                      if isinstance(r, dict) and isinstance(r.get(time_field), str)
+                  )
+                  result = (
+                      f"{name}: HTTP 200 | rows={len(rows)}"
+                      f" | oldest={times[0] if times else 'missing'}"
+                      f" | latest={times[-1] if times else 'missing'}"
+                  )
+                  passed += 1
+              except urllib.error.HTTPError as error:
+                  result = f"{name}: HTTP {error.code}"
+              except Exception as error:
+                  result = f"{name}: ERROR {type(error).__name__}: {error}"
+              print(result)
+              report.append("- " + result)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(report) + "\n")
+          if passed == 0:
+              raise SystemExit(1)
+          PY
